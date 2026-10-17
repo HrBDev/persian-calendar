@@ -47,14 +47,38 @@ jobs:
           distribution: temurin
 
       - name: Build and send apks to telegram
+        env:
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
         run: |
           ./gradlew assembleNightly
           apk_path="$(find . -type f -iname *.apk)"
-          curl https://api.telegram.org/bot${{ secrets.TELEGRAM_TOKEN }}/sendDocument \
-            -F chat_id=${{ secrets.TELEGRAM_CHAT_ID }} \
-            -F "caption=Size: $(ls -l --block-size=K "$apk_path" | awk '{ print $5 }')" \
-            -F parse_mode=HTML \
-            -F document=@"$apk_path"
+          jq -nr --arg repository "$GITHUB_REPOSITORY" --arg ref "$GITHUB_REF_NAME" \
+            --arg sha "$GITHUB_SHA" --arg run "$GITHUB_RUN_ID" \
+            --arg size "$(du -h --apparent-size "$apk_path" | cut -f1)" '
+            def escaped($n):
+              if length > $n then .[:($n - 1)] + "…" else . end | @html;
+            def link($url; $label): "<a href=\"" + ($url | @html) + "\">" + $label + "</a>";
+            ("https://github.com/" + $repository) as $base |
+            ("<b>📦 Persian Calendar · Nightly APK</b>\n<i>Development build</i>\n\n" +
+              "<b>Branch:</b> <code>" + ($ref | escaped(80)) + "</code>\n" +
+              "<b>Commit:</b> " + link($base + "/commit/" + ($sha | @uri); ($sha[:8] | @html)) +
+              "\n<b>Size:</b> " + ($size | escaped(20)) + "\n\n" +
+              link($base + "/actions/runs/" + ($run | @uri); "Build details") +
+              " · @Persian_Calendar") |
+            # Raw UTF-8 bytes conservatively bound the parsed caption length.
+            if utf8bytelength <= 1024 then . else
+              "<b>📦 Persian Calendar · Nightly APK</b>\nSize: " + ($size | escaped(20)) +
+              "\nCommit: <code>" + ($sha[:8] | @html) + "</code>\n@Persian_Calendar"
+            end
+          ' > "$RUNNER_TEMP/telegram-caption.html"
+          curl --fail --silent --show-error \
+            "https://api.telegram.org/bot$TELEGRAM_TOKEN/sendDocument" \
+            --form-string "chat_id=$TELEGRAM_CHAT_ID" \
+            -F "caption=<$RUNNER_TEMP/telegram-caption.html" \
+            --form-string parse_mode=HTML \
+            -F document=@"$apk_path" |
+            jq -e '.ok == true' > /dev/null
           rm "$apk_path"
 
   update-report:

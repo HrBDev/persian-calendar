@@ -14,23 +14,57 @@ jobs:
     steps:
       - name: Notify
         env:
-          COMMITS: ${{ toJson(github.event.commits) }}
-          TEMPLATE: '.[] | "<a href=\"\(.url)\">\(.id[:8])</a> • <a href=\"https://github.com/\(.author.username | @html)\">\(.author.username | @html)</a>
-
-          \(.message | gsub("(?<a>[<>&\"])"; .a|@html))
-
-          "'
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
         run: |
-          (
-            printenv COMMITS | jq -r "$TEMPLATE"
-            printf '📅 @Persian_Calendar'
-          ) | \
-          jq -R --slurp '{
-            text: .,
-            disable_web_page_preview: true,
-            chat_id: "${{ secrets.TELEGRAM_CHAT_ID }}",
-            parse_mode: "HTML"
-          }' | \
-          curl -X POST https://api.telegram.org/bot${{ secrets.TELEGRAM_TOKEN }}/sendMessage \
+          jq --arg chat_id "$TELEGRAM_CHAT_ID" \
+            --arg repository "$GITHUB_REPOSITORY" --arg ref "$GITHUB_REF_NAME" '
+            # Basic HTML only: https://core.telegram.org/bots/api#html-style
+            def short($n):
+              tostring | if length > $n then .[:($n - 1)] + "…" else . end;
+            def escaped($n): short($n) | @html;
+            # Count raw HTML conservatively in UTF-16, including tags/entities.
+            # The parsed message is therefore also within Telegram’s 4096 limit.
+            def units: [explode[] | if . > 65535 then 2 else 1 end] | add // 0;
+            def link($url; $label): "<a href=\"" + ($url | @html) + "\">" + $label + "</a>";
+            ("https://github.com/" + $repository) as $base |
+            (.commits // []) as $commits |
+            ("<b>📅 Persian Calendar · Source updates</b>\n" +
+              ($repository | escaped(100)) + " · <code>" + ($ref | escaped(80)) +
+              "</code>\n" + ($commits | length | tostring) +
+              (if ($commits | length) == 1 then " commit" else " commits" end)) as $header |
+            ("\n\n" + link($base + "/commits/" + ($ref | @uri); "View changes") +
+              " · @Persian_Calendar") as $footer |
+            reduce $commits[] as $commit (
+              {body: "", shown: 0, full: false};
+              if .full then . else
+                ($commit.author.username // "") as $username |
+                (($commit.author.username // $commit.author.name // "Unknown author") |
+                  escaped(60)) as $author |
+                (($commit.id // "") | tostring) as $sha |
+                (($commit.message // "Commit without a message") |
+                  split("\n")[0] | escaped(220)) as $subject |
+                ("\n\n<b>" + $subject + "</b>\n" +
+                  (if $sha == "" then "Commit" else
+                    link($base + "/commit/" + ($sha | @uri); ($sha[:8] | @html)) end) +
+                  " • " + (if $username == "" then $author else
+                    link("https://github.com/" + ($username | @uri); $author) end)) as $block |
+                if (($header + .body + $block + $footer) | units) <= 3900 then
+                  .body += $block | .shown += 1
+                else .full = true end
+              end
+            ) |
+            (($commits | length) - .shown) as $omitted |
+            ($header + (if .body == "" then "\n\nNo commit details available." else .body end) +
+              (if $omitted > 0 then "\n\n<i>" + ($omitted | tostring) +
+                (if $omitted == 1 then " more commit" else " more commits" end) + " in View changes.</i>" else "" end) + $footer) as $text |
+            if ($text | units) > 4096 then error("Telegram message exceeds limit") else
+              {text: $text, chat_id: $chat_id, parse_mode: "HTML",
+                link_preview_options: {is_disabled: true}}
+            end
+          ' "$GITHUB_EVENT_PATH" > "$RUNNER_TEMP/telegram-message.json"
+          curl --fail --silent --show-error \
+            "https://api.telegram.org/bot$TELEGRAM_TOKEN/sendMessage" \
             -H 'Content-Type: application/json' \
-            --data-binary @-
+            --data-binary @"$RUNNER_TEMP/telegram-message.json" |
+            jq -e '.ok == true' > /dev/null
